@@ -1,0 +1,9 @@
+barcpp
+*.o
+err
+out
+.DS_Store
+
+# Generated Wayland protocols
+protocols/*-protocol.c
+protocols/*-protocol.h
