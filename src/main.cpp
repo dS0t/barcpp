@@ -20,6 +20,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 #include <time.h>
 #include <netlink/netlink.h>
@@ -57,12 +58,14 @@ struct Config {
     int enable_temp  = 1;
     int enable_ram   = 1;
     int enable_wifi  = 1;
+    int enable_disk  = 1;
     int enable_bat   = 1;
     
     int interval_cpu_ms  = 1000;
     int interval_temp_ms = 5000;
     int interval_ram_ms  = 2000;
     int interval_wifi_ms = 5000;
+    int interval_disk_ms = 15000;
     int interval_bat_ms  = 10000;
 
     int bat_low_pct  = 20;
@@ -75,9 +78,12 @@ struct Config {
     int temp_max_c   = 100;
     int wifi_mid_dbm = -65;
     int wifi_low_dbm = -75;
+    int disk_mid_pct = 60;
+    int disk_high_pct = 80;
 
     char bat_path[256] = "";
     char temp_path[256] = "";
+    char disk_path[256] = "/";
 
     // XRGB8888, opaque
     uint32_t color_bg        = 0xFF161b22;
@@ -96,6 +102,9 @@ struct Config {
     uint32_t color_wifi      = 0xFFcba6f7;
     uint32_t color_wifi_mid  = 0xFFd29922;
     uint32_t color_wifi_low  = 0xFFf85149;
+    uint32_t color_disk      = 0xFFf0d64b;
+    uint32_t color_disk_mid  = 0xFFd29922;
+    uint32_t color_disk_high = 0xFFf85149;
 };
 
 Config cfg;
@@ -142,11 +151,13 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "enable_temp")) parse_int(val, &cfg.enable_temp);
     else if (!strcmp(key, "enable_ram"))  parse_int(val, &cfg.enable_ram);
     else if (!strcmp(key, "enable_wifi")) parse_int(val, &cfg.enable_wifi);
+    else if (!strcmp(key, "enable_disk")) parse_int(val, &cfg.enable_disk);
     else if (!strcmp(key, "enable_bat"))  parse_int(val, &cfg.enable_bat);
     else if (!strcmp(key, "interval_cpu_ms"))  parse_int(val, &cfg.interval_cpu_ms);
     else if (!strcmp(key, "interval_temp_ms")) parse_int(val, &cfg.interval_temp_ms);
     else if (!strcmp(key, "interval_ram_ms"))  parse_int(val, &cfg.interval_ram_ms);
     else if (!strcmp(key, "interval_wifi_ms")) parse_int(val, &cfg.interval_wifi_ms);
+    else if (!strcmp(key, "interval_disk_ms")) parse_int(val, &cfg.interval_disk_ms);
     else if (!strcmp(key, "interval_bat_ms"))  parse_int(val, &cfg.interval_bat_ms);
     else if (!strcmp(key, "bat_low_pct")) parse_int(val, &cfg.bat_low_pct);
     else if (!strcmp(key, "cpu_mid_pct")) parse_int(val, &cfg.cpu_mid_pct);
@@ -158,6 +169,8 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "temp_max_c"))   parse_int(val, &cfg.temp_max_c);
     else if (!strcmp(key, "wifi_mid_dbm")) parse_int(val, &cfg.wifi_mid_dbm);
     else if (!strcmp(key, "wifi_low_dbm")) parse_int(val, &cfg.wifi_low_dbm);
+    else if (!strcmp(key, "disk_mid_pct")) parse_int(val, &cfg.disk_mid_pct);
+    else if (!strcmp(key, "disk_high_pct")) parse_int(val, &cfg.disk_high_pct);
     else if (!strcmp(key, "bat_path")) {
         strncpy(cfg.bat_path, val, sizeof(cfg.bat_path) - 1);
         cfg.bat_path[sizeof(cfg.bat_path) - 1] = '\0';
@@ -165,6 +178,10 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "temp_path")) {
         strncpy(cfg.temp_path, val, sizeof(cfg.temp_path) - 1);
         cfg.temp_path[sizeof(cfg.temp_path) - 1] = '\0';
+    }
+    else if (!strcmp(key, "disk_path")) {
+        strncpy(cfg.disk_path, val, sizeof(cfg.disk_path) - 1);
+        cfg.disk_path[sizeof(cfg.disk_path) - 1] = '\0';
     }
     else if (!strcmp(key, "color_bg"))        parse_color(val, &cfg.color_bg);
     else if (!strcmp(key, "color_cpu"))       parse_color(val, &cfg.color_cpu);
@@ -182,6 +199,9 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "color_wifi"))      parse_color(val, &cfg.color_wifi);
     else if (!strcmp(key, "color_wifi_mid"))  parse_color(val, &cfg.color_wifi_mid);
     else if (!strcmp(key, "color_wifi_low"))  parse_color(val, &cfg.color_wifi_low);
+    else if (!strcmp(key, "color_disk"))      parse_color(val, &cfg.color_disk);
+    else if (!strcmp(key, "color_disk_mid"))  parse_color(val, &cfg.color_disk_mid);
+    else if (!strcmp(key, "color_disk_high")) parse_color(val, &cfg.color_disk_high);
 }
 
 void load_config_file(const char *path) {
@@ -412,6 +432,17 @@ int read_battery_percent() {
     return -1;
 }
 
+int read_disk_percent() {
+    struct statvfs st;
+    if (statvfs(cfg.disk_path, &st) != 0) return -1;
+    if (st.f_blocks == 0) return -1;
+    long long used = st.f_blocks - st.f_bavail;
+    int pct = (int)(used * 100 / st.f_blocks);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
 // Netlink callback to extract RSSI
 static int nl_callback(struct nl_msg *msg, void *arg) {
     int *rssi_out = static_cast<int *>(arg);
@@ -503,12 +534,14 @@ struct MetricCache {
     RamParts ram;
     int bat = -1;
     int wifi = 1; // 1 means not connected
+    int disk = -1;
 
     long long last_cpu_ms = 0;
     long long last_temp_ms = 0;
     long long last_ram_ms = 0;
     long long last_bat_ms = 0;
     long long last_wifi_ms = 0;
+    long long last_disk_ms = 0;
 };
 MetricCache cache;
 
@@ -538,6 +571,11 @@ void update_metrics() {
     if (cfg.enable_wifi && (now - cache.last_wifi_ms >= cfg.interval_wifi_ms || cache.last_wifi_ms == 0)) {
         cache.wifi = read_wifi_rssi();
         cache.last_wifi_ms = now;
+    }
+    
+    if (cfg.enable_disk && (now - cache.last_disk_ms >= cfg.interval_disk_ms || cache.last_disk_ms == 0)) {
+        cache.disk = read_disk_percent();
+        cache.last_disk_ms = now;
     }
 }
 
@@ -704,6 +742,7 @@ void draw(int width) {
     if (cfg.enable_temp && temp >= 0) dynamic_segments++;
     if (cfg.enable_ram) dynamic_segments++;
     if (cfg.enable_wifi && wifi_dbm < 0) dynamic_segments++;
+    if (cfg.enable_disk && cache.disk >= 0) dynamic_segments++;
     if (cfg.enable_bat && bat >= 0) dynamic_segments++;
 
     int total_segments = dynamic_segments;
@@ -897,6 +936,13 @@ void draw(int width) {
         int pct = clamp_pct((wifi_dbm + 90) * 100 / 40);
         // We pass solid_status_color=true so the whole bar uses the final color
         draw_segment(pct, cfg.color_wifi, cfg.color_wifi_mid, cfg.color_wifi_low, 33, 16, true, true);
+    }
+
+    // 3.5 DISK (if present)
+    if (cfg.enable_disk && cache.disk >= 0) {
+        int pct = clamp_pct(cache.disk);
+        // Pass solid_status_color=true to match WIFI/BAT pattern
+        draw_segment(pct, cfg.color_disk, cfg.color_disk_mid, cfg.color_disk_high, cfg.disk_mid_pct, cfg.disk_high_pct, true, true);
     }
 
     // 4. BAT (if present)
