@@ -81,6 +81,11 @@ struct Config {
     int disk_mid_pct = 60;
     int disk_high_pct = 80;
 
+    int enable_blink = 1;
+    int blink_warn_period_ms = 1000;
+    int blink_crit_period_ms = 300;
+    int blink_fast_poll_ms = 150;
+
     char bat_path[256] = "";
     char temp_path[256] = "";
     char disk_path[256] = "/";
@@ -171,6 +176,10 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "wifi_low_dbm")) parse_int(val, &cfg.wifi_low_dbm);
     else if (!strcmp(key, "disk_mid_pct")) parse_int(val, &cfg.disk_mid_pct);
     else if (!strcmp(key, "disk_high_pct")) parse_int(val, &cfg.disk_high_pct);
+    else if (!strcmp(key, "enable_blink")) parse_int(val, &cfg.enable_blink);
+    else if (!strcmp(key, "blink_warn_period_ms")) parse_int(val, &cfg.blink_warn_period_ms);
+    else if (!strcmp(key, "blink_crit_period_ms")) parse_int(val, &cfg.blink_crit_period_ms);
+    else if (!strcmp(key, "blink_fast_poll_ms")) parse_int(val, &cfg.blink_fast_poll_ms);
     else if (!strcmp(key, "bat_path")) {
         strncpy(cfg.bat_path, val, sizeof(cfg.bat_path) - 1);
         cfg.bat_path[sizeof(cfg.bat_path) - 1] = '\0';
@@ -519,6 +528,16 @@ int clamp_pct(int pct) {
     return pct;
 }
 
+// Returns 2 for critical, 1 for warning, 0 for normal.
+int get_marker_state(int pct, int mid_pct, int high_pct, bool inverse) {
+    if (inverse) {
+        return (pct < cfg.bat_low_pct) ? 2 : 0;
+    }
+    if (pct >= high_pct) return 2;
+    if (pct >= mid_pct) return 1;
+    return 0;
+}
+
 // ---------------------------------------------------------------------- //
 // Cached metric readings
 // ---------------------------------------------------------------------- //
@@ -542,6 +561,8 @@ struct MetricCache {
     long long last_bat_ms = 0;
     long long last_wifi_ms = 0;
     long long last_disk_ms = 0;
+
+    bool any_fast_blink = false;
 };
 MetricCache cache;
 
@@ -577,6 +598,29 @@ void update_metrics() {
         cache.disk = read_disk_percent();
         cache.last_disk_ms = now;
     }
+
+    cache.any_fast_blink = false;
+    if (cfg.enable_blink) {
+        if (cfg.enable_cpu && get_marker_state(cache.cpu, cfg.cpu_mid_pct, cfg.cpu_high_pct, false) == 2)
+            cache.any_fast_blink = true;
+        if (cfg.enable_temp && cache.temp >= 0 &&
+            get_marker_state(cache.temp * 100 / std::max(cfg.temp_max_c, 1),
+                             cfg.temp_mid_c * 100 / std::max(cfg.temp_max_c, 1),
+                             cfg.temp_high_c * 100 / std::max(cfg.temp_max_c, 1), false) == 2)
+            cache.any_fast_blink = true;
+        if (cfg.enable_ram && cache.ram.ok &&
+            get_marker_state(cache.ram.used_pct, cfg.ram_mid_pct, cfg.ram_high_pct, false) == 2)
+            cache.any_fast_blink = true;
+        if (cfg.enable_wifi && cache.wifi < 0 &&
+            get_marker_state((cache.wifi + 90) * 100 / 40, 33, 16, true) == 2)
+            cache.any_fast_blink = true;
+        if (cfg.enable_disk && cache.disk >= 0 &&
+            get_marker_state(clamp_pct(cache.disk), cfg.disk_mid_pct, cfg.disk_high_pct, true) == 2)
+            cache.any_fast_blink = true;
+        if (cfg.enable_bat && cache.bat >= 0 &&
+            get_marker_state(clamp_pct(cache.bat), 50, cfg.bat_low_pct, true) == 2)
+            cache.any_fast_blink = true;
+    }
 }
 
 uint32_t apply_opacity(uint32_t color, int opacity) {
@@ -611,26 +655,21 @@ uint32_t mix_colors(uint32_t c1, uint32_t c2, float ratio) {
 }
 
 // Determines the marker color. It is fully opaque if high/mid, else follows base opacity.
+// In warning/critical state the marker blinks (fades to background) unless disabled.
 uint32_t get_marker_color(int pct, uint32_t base_color, uint32_t mid_color, uint32_t high_color, int mid_pct, int high_pct, bool inverse) {
-    bool is_mid = false;
-    bool is_high = false;
+    int state = get_marker_state(pct, mid_pct, high_pct, inverse);
+    uint32_t col = apply_opacity(base_color, cfg.opacity_pct);
+    if (state == 2) col = apply_opacity(high_color, 100); // opaque red/critical
+    else if (state == 1) col = apply_opacity(mid_color, 100);  // opaque amber/warning
 
-    if (inverse) {
-        // lower is worse
-        if (pct < cfg.bat_low_pct) is_high = true; 
-    } else {
-        // higher is worse
-        if (pct >= high_pct) is_high = true;
-        else if (pct >= mid_pct) is_mid = true;
+    if (cfg.enable_blink && state > 0) {
+        long long now = get_time_ms();
+        int period = (state == 2) ? cfg.blink_crit_period_ms : cfg.blink_warn_period_ms;
+        if (period > 0 && ((now / period) % 2) != 0) {
+            col = apply_opacity(cfg.color_bg, cfg.opacity_pct); // Off phase -> fade to background
+        }
     }
-
-    if (is_high) {
-        return apply_opacity(high_color, 100); // opaque red/critical
-    } else if (is_mid) {
-        return apply_opacity(mid_color, 100);  // opaque amber/warning
-    } else {
-        return apply_opacity(base_color, cfg.opacity_pct);
-    }
+    return col;
 }
 
 // Determines the color of the fill bar
@@ -1044,7 +1083,8 @@ int main() {
         wl_display_flush(display);
 
         pollfd pfd{wl_fd, POLLIN, 0};
-        int ret = poll(&pfd, 1, cfg.poll_ms);
+        int timeout = (cfg.enable_blink && cache.any_fast_blink) ? cfg.blink_fast_poll_ms : cfg.poll_ms;
+        int ret = poll(&pfd, 1, timeout);
         if (ret > 0 && (pfd.revents & POLLIN)) {
             if (wl_display_dispatch(display) < 0) break;
         } else if (ret == 0) {

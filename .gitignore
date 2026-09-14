@@ -2,6 +2,7 @@ barcpp
 *.o
 err
 out
+nohup.out
 .DS_Store
 
 # Generated Wayland protocols
