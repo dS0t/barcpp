@@ -3,7 +3,7 @@
 // wlr-layer-shell, direct pixel writes into a shared-memory buffer.
 //
 // Resource footprint: no forked subprocesses, no widget toolkit, no timers
-// beyond a single poll() with a 1s timeout. RSS is typically a couple of MB
+// beyond a single poll() with a poll_ms timeout. RSS is typically a couple of MB
 // (mostly the mmapped pixel buffer + wayland library), CPU is ~0% between
 // redraws and a handful of microseconds per redraw (a few hundred pixels).
 
@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -29,6 +30,9 @@
 #include <linux/nl80211.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <csignal>
+
+#include "logic.h"
 
 namespace {
 
@@ -60,6 +64,8 @@ struct Config {
     int enable_wifi  = 1;
     int enable_disk  = 1;
     int enable_bat   = 1;
+    int enable_swap  = 1;
+    int enable_psi   = 1;
     
     int interval_cpu_ms  = 1000;
     int interval_temp_ms = 5000;
@@ -67,8 +73,10 @@ struct Config {
     int interval_wifi_ms = 5000;
     int interval_disk_ms = 15000;
     int interval_bat_ms  = 10000;
+    int interval_psi_ms  = 2000;
 
-    int bat_low_pct  = 20;
+    int bat_mid_pct  = 30;
+    int bat_low_pct  = 10;
     int cpu_mid_pct  = 20;
     int cpu_high_pct = 80;
     int ram_mid_pct  = 60;
@@ -80,9 +88,13 @@ struct Config {
     int wifi_low_dbm = -75;
     int disk_mid_pct = 60;
     int disk_high_pct = 80;
+    int swap_mid_pct  = 25;
+    int swap_high_pct = 60;
+    int psi_mid_pct   = 5;
+    int psi_high_pct  = 20;
+    int psi_overlay   = 1;
 
     int enable_blink = 1;
-    int blink_warn_period_ms = 1000;
     int blink_crit_period_ms = 300;
     int blink_fast_poll_ms = 150;
 
@@ -103,13 +115,20 @@ struct Config {
     uint32_t color_ram_mid   = 0xFFd29922;
     uint32_t color_ram_high  = 0xFFf85149;
     uint32_t color_bat       = 0xFFf778ba;
+    uint32_t color_bat_idle  = 0xFF8b949e;
+    uint32_t color_bat_mid   = 0xFFd29922;
     uint32_t color_bat_low   = 0xFFf85149;
+    uint32_t color_bat_charging = 0xFF2ea043;
     uint32_t color_wifi      = 0xFFcba6f7;
     uint32_t color_wifi_mid  = 0xFFd29922;
     uint32_t color_wifi_low  = 0xFFf85149;
     uint32_t color_disk      = 0xFFf0d64b;
     uint32_t color_disk_mid  = 0xFFd29922;
     uint32_t color_disk_high = 0xFFf85149;
+    uint32_t color_swap      = 0xFFbc8cff;
+    uint32_t color_swap_mid  = 0xFFd29922;
+    uint32_t color_swap_high = 0xFFf85149;
+    uint32_t color_psi       = 0xFFffa657;
 };
 
 Config cfg;
@@ -158,12 +177,16 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "enable_wifi")) parse_int(val, &cfg.enable_wifi);
     else if (!strcmp(key, "enable_disk")) parse_int(val, &cfg.enable_disk);
     else if (!strcmp(key, "enable_bat"))  parse_int(val, &cfg.enable_bat);
+    else if (!strcmp(key, "enable_swap")) parse_int(val, &cfg.enable_swap);
+    else if (!strcmp(key, "enable_psi"))  parse_int(val, &cfg.enable_psi);
     else if (!strcmp(key, "interval_cpu_ms"))  parse_int(val, &cfg.interval_cpu_ms);
     else if (!strcmp(key, "interval_temp_ms")) parse_int(val, &cfg.interval_temp_ms);
     else if (!strcmp(key, "interval_ram_ms"))  parse_int(val, &cfg.interval_ram_ms);
     else if (!strcmp(key, "interval_wifi_ms")) parse_int(val, &cfg.interval_wifi_ms);
     else if (!strcmp(key, "interval_disk_ms")) parse_int(val, &cfg.interval_disk_ms);
     else if (!strcmp(key, "interval_bat_ms"))  parse_int(val, &cfg.interval_bat_ms);
+    else if (!strcmp(key, "interval_psi_ms"))  parse_int(val, &cfg.interval_psi_ms);
+    else if (!strcmp(key, "bat_mid_pct")) parse_int(val, &cfg.bat_mid_pct);
     else if (!strcmp(key, "bat_low_pct")) parse_int(val, &cfg.bat_low_pct);
     else if (!strcmp(key, "cpu_mid_pct")) parse_int(val, &cfg.cpu_mid_pct);
     else if (!strcmp(key, "cpu_high_pct")) parse_int(val, &cfg.cpu_high_pct);
@@ -176,8 +199,12 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "wifi_low_dbm")) parse_int(val, &cfg.wifi_low_dbm);
     else if (!strcmp(key, "disk_mid_pct")) parse_int(val, &cfg.disk_mid_pct);
     else if (!strcmp(key, "disk_high_pct")) parse_int(val, &cfg.disk_high_pct);
+    else if (!strcmp(key, "swap_mid_pct"))  parse_int(val, &cfg.swap_mid_pct);
+    else if (!strcmp(key, "swap_high_pct")) parse_int(val, &cfg.swap_high_pct);
+    else if (!strcmp(key, "psi_mid_pct"))   parse_int(val, &cfg.psi_mid_pct);
+    else if (!strcmp(key, "psi_high_pct"))  parse_int(val, &cfg.psi_high_pct);
+    else if (!strcmp(key, "psi_overlay"))   parse_int(val, &cfg.psi_overlay);
     else if (!strcmp(key, "enable_blink")) parse_int(val, &cfg.enable_blink);
-    else if (!strcmp(key, "blink_warn_period_ms")) parse_int(val, &cfg.blink_warn_period_ms);
     else if (!strcmp(key, "blink_crit_period_ms")) parse_int(val, &cfg.blink_crit_period_ms);
     else if (!strcmp(key, "blink_fast_poll_ms")) parse_int(val, &cfg.blink_fast_poll_ms);
     else if (!strcmp(key, "bat_path")) {
@@ -204,13 +231,20 @@ void apply_kv(const char *key, const char *val) {
     else if (!strcmp(key, "color_ram_mid"))   parse_color(val, &cfg.color_ram_mid);
     else if (!strcmp(key, "color_ram_high"))  parse_color(val, &cfg.color_ram_high);
     else if (!strcmp(key, "color_bat"))       parse_color(val, &cfg.color_bat);
+    else if (!strcmp(key, "color_bat_idle"))  parse_color(val, &cfg.color_bat_idle);
+    else if (!strcmp(key, "color_bat_mid"))   parse_color(val, &cfg.color_bat_mid);
     else if (!strcmp(key, "color_bat_low"))   parse_color(val, &cfg.color_bat_low);
+    else if (!strcmp(key, "color_bat_charging")) parse_color(val, &cfg.color_bat_charging);
     else if (!strcmp(key, "color_wifi"))      parse_color(val, &cfg.color_wifi);
     else if (!strcmp(key, "color_wifi_mid"))  parse_color(val, &cfg.color_wifi_mid);
     else if (!strcmp(key, "color_wifi_low"))  parse_color(val, &cfg.color_wifi_low);
     else if (!strcmp(key, "color_disk"))      parse_color(val, &cfg.color_disk);
     else if (!strcmp(key, "color_disk_mid"))  parse_color(val, &cfg.color_disk_mid);
     else if (!strcmp(key, "color_disk_high")) parse_color(val, &cfg.color_disk_high);
+    else if (!strcmp(key, "color_swap"))      parse_color(val, &cfg.color_swap);
+    else if (!strcmp(key, "color_swap_mid"))  parse_color(val, &cfg.color_swap_mid);
+    else if (!strcmp(key, "color_swap_high")) parse_color(val, &cfg.color_swap_high);
+    else if (!strcmp(key, "color_psi"))       parse_color(val, &cfg.color_psi);
 }
 
 void load_config_file(const char *path) {
@@ -240,6 +274,7 @@ void load_config_file(const char *path) {
     if (cfg.height > 64) cfg.height = 64;
     if (cfg.gap_px < 0) cfg.gap_px = 0;
     if (cfg.poll_ms < 100) cfg.poll_ms = 100;
+    if (cfg.blink_fast_poll_ms < 50) cfg.blink_fast_poll_ms = 50;
 }
 
 // Resolve config path: $BARCPP_CONFIG, then <exe_dir>/barcpp.conf,
@@ -289,6 +324,7 @@ zwlr_layer_surface_v1  *layer_surface = nullptr;
 int  surf_width = 0;
 bool configured = false;
 bool running    = true;
+volatile sig_atomic_t reload_pending = 0;
 
 struct Buffer {
     wl_buffer *wlbuf  = nullptr;
@@ -299,6 +335,8 @@ std::array<Buffer, 2> buffers;
 int      cur_buffer = 0;
 uint8_t *shm_data   = nullptr;
 size_t   shm_size   = 0;
+bool     has_last_frame = false;
+uint64_t last_frame_hash = 0;
 
 // ---------------------------------------------------------------------- //
 // /proc readers -- plain file reads, no fork/exec anywhere
@@ -377,20 +415,24 @@ struct RamParts {
     int avail_pct = 0;
     int used_pct  = 100; // 100 - avail
     bool ok       = false;
+    bool has_swap = false;
+    int swap_used_pct = 0;
 };
 
 RamParts read_ram_parts() {
     RamParts r;
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return r;
-    long total = 0, avail = 0, free_kb = 0;
+    long total = 0, avail = 0, free_kb = 0, swap_total = 0, swap_free = 0;
+    int found = 0; // MemTotal, MemAvailable, MemFree, SwapTotal, SwapFree
     char line[256];
-    while (fgets(line, sizeof line, f)) {
+    while (found < 5 && fgets(line, sizeof line, f)) {
         long val = 0;
-        if (sscanf(line, "MemTotal: %ld", &val) == 1) total = val;
-        else if (sscanf(line, "MemAvailable: %ld", &val) == 1) avail = val;
-        else if (sscanf(line, "MemFree: %ld", &val) == 1) free_kb = val;
-        if (total && avail && free_kb) break;
+        if (sscanf(line, "MemTotal: %ld", &val) == 1) { total = val; ++found; }
+        else if (sscanf(line, "MemAvailable: %ld", &val) == 1) { avail = val; ++found; }
+        else if (sscanf(line, "MemFree: %ld", &val) == 1) { free_kb = val; ++found; }
+        else if (sscanf(line, "SwapTotal: %ld", &val) == 1) { swap_total = val; ++found; }
+        else if (sscanf(line, "SwapFree: %ld", &val) == 1) { swap_free = val; ++found; }
     }
     fclose(f);
     if (total <= 0) return r;
@@ -401,24 +443,55 @@ RamParts read_ram_parts() {
     r.avail_pct = static_cast<int>(100L * avail / total);
     r.used_pct  = 100 - r.avail_pct;
     r.ok        = true;
+    if (swap_total > 0) {
+        if (swap_free < 0) swap_free = 0;
+        if (swap_free > swap_total) swap_free = swap_total;
+        r.has_swap = true;
+        r.swap_used_pct = static_cast<int>(100L * (swap_total - swap_free) / swap_total);
+    }
     return r;
 }
 
-int read_battery_percent() {
+struct BatteryInfo {
+    int pct = -1;
+    bool has_status = false;
+    bool charging = false;
+};
+
+// Reads "capacity" and, from the same directory, "status" of the battery.
+BatteryInfo read_battery() {
     static bool warned = false;
-    if (cfg.bat_path[0] != '\0') {
-        FILE *f = fopen(cfg.bat_path, "r");
-        if (f) {
-            int v = -1;
-            int n = fscanf(f, "%d", &v);
-            fclose(f);
-            if (n == 1) return v;
+    BatteryInfo info;
+
+    auto read_capacity = [&](const char *cap_path) {
+        FILE *f = fopen(cap_path, "r");
+        if (!f) return false;
+        int v = -1;
+        int n = fscanf(f, "%d", &v);
+        fclose(f);
+        if (n != 1) return false;
+        info.pct = v;
+
+        const char *slash = strrchr(cap_path, '/');
+        size_t dir_len = slash ? static_cast<size_t>(slash - cap_path) + 1 : 0;
+        char status_path[PATH_MAX];
+        snprintf(status_path, sizeof status_path, "%.*sstatus", static_cast<int>(dir_len), cap_path);
+        char status[32] = "";
+        if (FILE *sf = fopen(status_path, "r")) {
+            info.has_status = fgets(status, sizeof status, sf) != nullptr;
+            fclose(sf);
         }
+        info.charging = !strncmp(status, "Charging", 8);
+        return true;
+    };
+
+    if (cfg.bat_path[0] != '\0') {
+        if (read_capacity(cfg.bat_path)) return info;
         if (!warned) {
             fprintf(stderr, "barcpp: Battery sensor not found at bat_path: %s\n", cfg.bat_path);
             warned = true;
         }
-        return -1;
+        return info;
     }
 
     static const char *paths[] = {
@@ -426,19 +499,65 @@ int read_battery_percent() {
         "/sys/class/power_supply/BAT1/capacity",
     };
     for (auto p : paths) {
-        FILE *f = fopen(p, "r");
-        if (!f) continue;
-        int v = -1;
-        int n = fscanf(f, "%d", &v);
-        fclose(f);
-        if (n == 1) return v;
+        if (read_capacity(p)) return info;
     }
-    
+
     if (!warned) {
         fprintf(stderr, "barcpp: Battery sensor not found in standard paths. Please specify bat_path in barcpp.conf\n");
         warned = true;
     }
-    return -1;
+    return info;
+}
+
+// Returns 1 if the AC adapter (power_supply type "Mains") is online, 0 if not, -1 if unknown.
+// The adapter is searched once; afterwards only its "online" file is read.
+int read_ac_online() {
+    static char online_path[PATH_MAX] = "";
+    static bool searched = false;
+    if (!searched) {
+        searched = true;
+        if (DIR *d = opendir("/sys/class/power_supply")) {
+            while (dirent *e = readdir(d)) {
+                if (e->d_name[0] == '.') continue;
+                char type_path[PATH_MAX];
+                snprintf(type_path, sizeof type_path, "/sys/class/power_supply/%s/type", e->d_name);
+                char type[32] = "";
+                if (FILE *f = fopen(type_path, "r")) {
+                    fgets(type, sizeof type, f);
+                    fclose(f);
+                }
+                if (!strncmp(type, "Mains", 5)) {
+                    snprintf(online_path, sizeof online_path, "/sys/class/power_supply/%s/online", e->d_name);
+                    break;
+                }
+            }
+            closedir(d);
+        }
+    }
+    if (online_path[0] == '\0') return -1;
+    FILE *f = fopen(online_path, "r");
+    if (!f) return -1;
+    int v = -1;
+    int n = fscanf(f, "%d", &v);
+    fclose(f);
+    return n == 1 ? v : -1;
+}
+
+// Memory pressure: percent of the last 10 s in which some task stalled on memory (PSI "some avg10").
+// Returns -1 if PSI is not available on this kernel; it is not retried after that.
+int read_psi_memory_pct() {
+    static bool unavailable = false;
+    if (unavailable) return -1;
+    FILE *f = fopen("/proc/pressure/memory", "r");
+    if (!f) {
+        unavailable = true;
+        fprintf(stderr, "barcpp: /proc/pressure/memory not available, PSI disabled\n");
+        return -1;
+    }
+    float avg10 = -1.0f;
+    int n = fscanf(f, "some avg10=%f", &avg10);
+    fclose(f);
+    return n == 1 ? static_cast<int>(avg10) : -1;
 }
 
 int read_disk_percent() {
@@ -522,22 +641,6 @@ int read_wifi_rssi() {
     return rssi;
 }
 
-int clamp_pct(int pct) {
-    if (pct < 0) return 0;
-    if (pct > 100) return 100;
-    return pct;
-}
-
-// Returns 2 for critical, 1 for warning, 0 for normal.
-int get_marker_state(int pct, int mid_pct, int high_pct, bool inverse) {
-    if (inverse) {
-        return (pct < cfg.bat_low_pct) ? 2 : 0;
-    }
-    if (pct >= high_pct) return 2;
-    if (pct >= mid_pct) return 1;
-    return 0;
-}
-
 // ---------------------------------------------------------------------- //
 // Cached metric readings
 // ---------------------------------------------------------------------- //
@@ -552,8 +655,12 @@ struct MetricCache {
     int temp = -1;
     RamParts ram;
     int bat = -1;
+    bool bat_charging = false;
+    bool bat_not_charging = false;
+    bool ac_online = false;
     int wifi = 1; // 1 means not connected
     int disk = -1;
+    int psi = -1;
 
     long long last_cpu_ms = 0;
     long long last_temp_ms = 0;
@@ -561,10 +668,23 @@ struct MetricCache {
     long long last_bat_ms = 0;
     long long last_wifi_ms = 0;
     long long last_disk_ms = 0;
+    long long last_psi_ms = 0;
 
     bool any_fast_blink = false;
 };
 MetricCache cache;
+
+// Memory pressure state (PSI) shared by the RAM and SWAP markers; 0 if disabled or unavailable.
+int get_psi_state() {
+    if (!cfg.enable_psi || cache.psi < 0) return 0;
+    return get_marker_state(cache.psi, cfg.psi_mid_pct, cfg.psi_high_pct, false);
+}
+
+// Length of the PSI overlay bar in percent of the SWAP segment; -1 if there is no overlay.
+int get_psi_overlay_pct() {
+    if (!cfg.enable_psi || !cfg.psi_overlay || cache.psi < 0) return -1;
+    return psi_overlay_pct(cache.psi, cfg.psi_high_pct);
+}
 
 void update_metrics() {
     long long now = get_time_ms();
@@ -583,9 +703,18 @@ void update_metrics() {
         cache.ram = read_ram_parts();
         cache.last_ram_ms = now;
     }
+
+    if (cfg.enable_psi && (now - cache.last_psi_ms >= cfg.interval_psi_ms || cache.last_psi_ms == 0)) {
+        cache.psi = read_psi_memory_pct();
+        cache.last_psi_ms = now;
+    }
     
     if (cfg.enable_bat && (now - cache.last_bat_ms >= cfg.interval_bat_ms || cache.last_bat_ms == 0)) {
-        cache.bat = read_battery_percent();
+        BatteryInfo bi = read_battery();
+        cache.bat = bi.pct;
+        cache.bat_charging = bi.charging;
+        cache.ac_online = read_ac_online() == 1;
+        cache.bat_not_charging = bi.has_status && !bi.charging && cache.ac_online;
         cache.last_bat_ms = now;
     }
     
@@ -609,16 +738,22 @@ void update_metrics() {
                              cfg.temp_high_c * 100 / std::max(cfg.temp_max_c, 1), false) == 2)
             cache.any_fast_blink = true;
         if (cfg.enable_ram && cache.ram.ok &&
-            get_marker_state(cache.ram.used_pct, cfg.ram_mid_pct, cfg.ram_high_pct, false) == 2)
+            std::max(get_marker_state(cache.ram.used_pct, cfg.ram_mid_pct, cfg.ram_high_pct, false),
+                     get_psi_state()) == 2)
+            cache.any_fast_blink = true;
+        if (cfg.enable_swap && cache.ram.ok && cache.ram.has_swap &&
+            std::max(get_marker_state(cache.ram.swap_used_pct, cfg.swap_mid_pct, cfg.swap_high_pct, false),
+                     get_psi_state()) == 2)
             cache.any_fast_blink = true;
         if (cfg.enable_wifi && cache.wifi < 0 &&
-            get_marker_state((cache.wifi + 90) * 100 / 40, 33, 16, true) == 2)
+            get_marker_state(wifi_dbm_to_pct(cache.wifi), wifi_dbm_to_pct(cfg.wifi_mid_dbm),
+                             wifi_dbm_to_pct(cfg.wifi_low_dbm), true) == 2)
             cache.any_fast_blink = true;
         if (cfg.enable_disk && cache.disk >= 0 &&
-            get_marker_state(clamp_pct(cache.disk), cfg.disk_mid_pct, cfg.disk_high_pct, true) == 2)
+            get_marker_state(clamp_pct(cache.disk), cfg.disk_mid_pct, cfg.disk_high_pct, false) == 2)
             cache.any_fast_blink = true;
-        if (cfg.enable_bat && cache.bat >= 0 &&
-            get_marker_state(clamp_pct(cache.bat), 50, cfg.bat_low_pct, true) == 2)
+        if (cfg.enable_bat && cache.bat >= 0 && !cache.bat_charging &&
+            get_marker_state(clamp_pct(cache.bat), cfg.bat_mid_pct, cfg.bat_low_pct, true) == 2)
             cache.any_fast_blink = true;
     }
 }
@@ -654,22 +789,40 @@ uint32_t mix_colors(uint32_t c1, uint32_t c2, float ratio) {
     return (r << 16) | (g << 8) | b;
 }
 
-// Determines the marker color. It is fully opaque if high/mid, else follows base opacity.
+// Warning blink phase flips once per poll_ms, so it does not depend on the
+// faster critical redraw cadence and does not alias with the sampling rate.
+struct WarnBlink {
+    bool off = false;
+    long long last_flip_ms = 0;
+};
+WarnBlink warn_blink;
+
+// Determines the marker color for a state (0 normal, 1 warning, 2 critical).
+// It is fully opaque if high/mid, else follows base opacity.
 // In warning/critical state the marker blinks (fades to background) unless disabled.
-uint32_t get_marker_color(int pct, uint32_t base_color, uint32_t mid_color, uint32_t high_color, int mid_pct, int high_pct, bool inverse) {
-    int state = get_marker_state(pct, mid_pct, high_pct, inverse);
+uint32_t marker_color(int state, uint32_t base_color, uint32_t mid_color, uint32_t high_color) {
     uint32_t col = apply_opacity(base_color, cfg.opacity_pct);
     if (state == 2) col = apply_opacity(high_color, 100); // opaque red/critical
     else if (state == 1) col = apply_opacity(mid_color, 100);  // opaque amber/warning
 
-    if (cfg.enable_blink && state > 0) {
-        long long now = get_time_ms();
-        int period = (state == 2) ? cfg.blink_crit_period_ms : cfg.blink_warn_period_ms;
-        if (period > 0 && ((now / period) % 2) != 0) {
-            col = apply_opacity(cfg.color_bg, cfg.opacity_pct); // Off phase -> fade to background
+    if (cfg.enable_blink) {
+        if (state == 2) {
+            long long now = get_time_ms();
+            int period = cfg.blink_crit_period_ms;
+            if (period > 0 && ((now / period) % 2) != 0) {
+                col = apply_opacity(cfg.color_bg, cfg.opacity_pct); // Off phase -> fade to background
+            }
+        } else if (state == 1 && warn_blink.off) {
+            col = apply_opacity(cfg.color_bg, cfg.opacity_pct);
         }
     }
     return col;
+}
+
+// Battery marker while charging: slow green blink, no warning/critical states.
+uint32_t get_charging_marker_color() {
+    if (cfg.enable_blink && warn_blink.off) return apply_opacity(cfg.color_bg, cfg.opacity_pct);
+    return apply_opacity(cfg.color_bat_charging, 100);
 }
 
 // Determines the color of the fill bar
@@ -681,9 +834,9 @@ uint32_t get_fill_color(int local_pct, uint32_t base_color, uint32_t mid_color, 
     // Gradient skin logic
     uint32_t c;
     if (inverse) {
-        if (local_pct < cfg.bat_low_pct) c = high_color; // usually bat_low
+        if (local_pct < high_pct) c = high_color;
         else if (local_pct < mid_pct) {
-            float ratio = (float)(local_pct - cfg.bat_low_pct) / std::max(mid_pct - cfg.bat_low_pct, 1);
+            float ratio = (float)(local_pct - high_pct) / std::max(mid_pct - high_pct, 1);
             c = mix_colors(high_color, base_color, ratio);
         } else {
             c = base_color;
@@ -712,6 +865,7 @@ const wl_buffer_listener buffer_listener = {
 };
 
 void free_shm() {
+    has_last_frame = false;
     for (int i = 0; i < 2; ++i) {
         if (buffers[i].wlbuf) {
             wl_buffer_destroy(buffers[i].wlbuf);
@@ -728,6 +882,7 @@ void free_shm() {
 }
 
 bool alloc_shm(int width, int height) {
+    has_last_frame = false;
     size_t stride = static_cast<size_t>(width) * 4;
     size_t single = stride * static_cast<size_t>(height);
     shm_size       = single * 2;
@@ -762,17 +917,44 @@ void fill_span(uint32_t *pixels, int width, int x0, int x1, uint32_t col) {
             pixels[y * width + x] = col;
 }
 
+// Sends the buffer to the compositor only if its pixels differ from the last frame sent.
+void commit_frame(Buffer &b, int width) {
+    uint64_t hash = 1469598103934665603ull; // FNV-1a
+    const size_t count = static_cast<size_t>(width) * cfg.height;
+    for (size_t i = 0; i < count; ++i) {
+        hash ^= b.pixels[i];
+        hash *= 1099511628211ull;
+    }
+    if (has_last_frame && hash == last_frame_hash) return;
+    has_last_frame = true;
+    last_frame_hash = hash;
+
+    wl_surface_attach(surface, b.wlbuf, 0, 0);
+    wl_surface_damage_buffer(surface, 0, 0, width, cfg.height);
+    b.busy = true;
+    wl_surface_commit(surface);
+    cur_buffer ^= 1;
+}
+
 void draw(int width) {
-    if (width <= 0) return;
+    if (width <= 0 || !configured) return;
     Buffer &b = buffers[cur_buffer];
     if (b.busy) return;
 
     update_metrics();
 
+    long long now = get_time_ms();
+    if (now - warn_blink.last_flip_ms >= cfg.poll_ms) {
+        warn_blink.off = !warn_blink.off;
+        warn_blink.last_flip_ms = now;
+    }
+
     int cpu = cache.cpu;
     int temp = cache.temp;
     RamParts ram = cache.ram;
     int bat = cache.bat;
+    bool bat_charging = cache.bat_charging;
+    bool bat_not_charging = cache.bat_not_charging;
     int wifi_dbm = cache.wifi;
 
     // Count dynamic segments
@@ -780,6 +962,7 @@ void draw(int width) {
     if (cfg.enable_cpu) dynamic_segments++;
     if (cfg.enable_temp && temp >= 0) dynamic_segments++;
     if (cfg.enable_ram) dynamic_segments++;
+    if (cfg.enable_swap && ram.ok && ram.has_swap) dynamic_segments++;
     if (cfg.enable_wifi && wifi_dbm < 0) dynamic_segments++;
     if (cfg.enable_disk && cache.disk >= 0) dynamic_segments++;
     if (cfg.enable_bat && bat >= 0) dynamic_segments++;
@@ -788,11 +971,7 @@ void draw(int width) {
 
     if (total_segments == 0) {
         fill_span(b.pixels, width, 0, width, apply_opacity(cfg.color_bg, cfg.opacity_pct));
-        wl_surface_attach(surface, b.wlbuf, 0, 0);
-        wl_surface_damage_buffer(surface, 0, 0, width, cfg.height);
-        b.busy = true;
-        wl_surface_commit(surface);
-        cur_buffer ^= 1;
+        commit_frame(b, width);
         return;
     }
 
@@ -807,23 +986,30 @@ void draw(int width) {
     int current_seg = 0;
     
     // Helper to draw a single dynamic segment with speedometer colors and skins
-    auto draw_segment = [&](int pct, uint32_t base_color, uint32_t mid_color, uint32_t high_color, int mid_pct, int high_pct, bool inverse, bool solid_status_color = false) {
+    auto draw_segment = [&](int pct, uint32_t base_color, uint32_t mid_color, uint32_t high_color, int mid_pct, int high_pct, bool inverse, bool solid_status_color = false, bool charging = false, int extra_state = 0, int overlay_pct = -1) {
         int w = seg_w + (current_seg == dynamic_segments - 1 ? rem : 0);
         int fill_w = w * pct / 100;
+        int overlay_w = overlay_pct >= 0 ? w * overlay_pct / 100 : 0;
+        int bar_w = std::max(fill_w, overlay_w);
+        int marker_state = std::max(get_marker_state(pct, mid_pct, high_pct, inverse), extra_state);
 
         bool is_zebra = !strcmp(cfg.skin, "zebra");
         bool is_blocks = !strcmp(cfg.skin, "blocks");
 
         // Request color at 100% opacity, so we don't double-multiply it later
-        uint32_t overall_col = get_fill_color(pct, base_color, mid_color, high_color, mid_pct, high_pct, inverse, 100);
+        uint32_t overall_col = charging
+            ? apply_opacity(base_color, 100)
+            : get_fill_color(pct, base_color, mid_color, high_color, mid_pct, high_pct, inverse, 100);
         
-        for (int dx = 0; dx < fill_w; ++dx) {
+        for (int dx = 0; dx < bar_w; ++dx) {
             uint32_t col;
             bool draw_pixel = true;
 
             // Marker logic
             if (dx < cfg.marker_px) {
-                col = get_marker_color(pct, base_color, mid_color, high_color, mid_pct, high_pct, inverse);
+                col = charging
+                    ? get_charging_marker_color()
+                    : marker_color(marker_state, base_color, mid_color, high_color);
             } else if (dx < cfg.marker_px + cfg.marker_gap_px) {
                 draw_pixel = false; // Gap after marker
             } else {
@@ -842,6 +1028,7 @@ void draw(int width) {
                 } else {
                     col = get_fill_color(local_pct, base_color, mid_color, high_color, mid_pct, high_pct, inverse, alpha);
                 }
+                if (dx < overlay_w) col = apply_opacity(cfg.color_psi, 100); // PSI bar drawn on top of the fill
 
                 if (is_zebra) {
                     int shifted_dx = dx - (cfg.marker_px + cfg.marker_gap_px);
@@ -892,6 +1079,8 @@ void draw(int width) {
             int used_pct  = clamp_pct(ram.used_pct);
             int reclaim_pct = clamp_pct(ram.avail_pct - ram.free_pct); // simplified for brevity
             if (reclaim_pct < 0) reclaim_pct = 0;
+            int ram_marker_state = std::max(get_marker_state(used_pct, cfg.ram_mid_pct, cfg.ram_high_pct, false),
+                                            get_psi_state());
 
             int used_w    = w * used_pct / 100;
             int reclaim_w = w * reclaim_pct / 100;
@@ -905,7 +1094,7 @@ void draw(int width) {
                 bool draw_pixel = true;
 
                 if (dx < cfg.marker_px) {
-                    col = get_marker_color(used_pct, cfg.color_ram_free, cfg.color_ram_mid, cfg.color_ram_high, cfg.ram_mid_pct, cfg.ram_high_pct, false);
+                    col = marker_color(ram_marker_state, cfg.color_ram_free, cfg.color_ram_mid, cfg.color_ram_high);
                 } else if (dx < cfg.marker_px + cfg.marker_gap_px) {
                     draw_pixel = false;
                 } else {
@@ -969,33 +1158,36 @@ void draw(int width) {
         current_seg++;
     }
 
+    // 2.5 SWAP (if present); memory pressure (PSI) also raises its marker
+    if (cfg.enable_swap && ram.ok && ram.has_swap) {
+        int pct = clamp_pct(ram.swap_used_pct);
+        draw_segment(pct, cfg.color_swap, cfg.color_swap_mid, cfg.color_swap_high,
+                     cfg.swap_mid_pct, cfg.swap_high_pct, false, false, false, get_psi_state(), get_psi_overlay_pct());
+    }
+
     // 3. WIFI (if present)
     if (cfg.enable_wifi && wifi_dbm < 0) {
-        // -50 dBm = 100%, -90 dBm = 0%
-        int pct = clamp_pct((wifi_dbm + 90) * 100 / 40);
+        int pct = wifi_dbm_to_pct(wifi_dbm);
         // We pass solid_status_color=true so the whole bar uses the final color
-        draw_segment(pct, cfg.color_wifi, cfg.color_wifi_mid, cfg.color_wifi_low, 33, 16, true, true);
+        draw_segment(pct, cfg.color_wifi, cfg.color_wifi_mid, cfg.color_wifi_low,
+                     wifi_dbm_to_pct(cfg.wifi_mid_dbm), wifi_dbm_to_pct(cfg.wifi_low_dbm), true, true);
     }
 
     // 3.5 DISK (if present)
     if (cfg.enable_disk && cache.disk >= 0) {
         int pct = clamp_pct(cache.disk);
         // Pass solid_status_color=true to match WIFI/BAT pattern
-        draw_segment(pct, cfg.color_disk, cfg.color_disk_mid, cfg.color_disk_high, cfg.disk_mid_pct, cfg.disk_high_pct, true, true);
+        draw_segment(pct, cfg.color_disk, cfg.color_disk_mid, cfg.color_disk_high, cfg.disk_mid_pct, cfg.disk_high_pct, false, true);
     }
 
     // 4. BAT (if present)
     if (cfg.enable_bat && bat >= 0) {
         int pct = clamp_pct(bat);
-        // Pass solid_status_color=true
-        draw_segment(pct, cfg.color_bat, cfg.color_bat_low, cfg.color_bat_low, 50, cfg.bat_low_pct, true, true);
+        uint32_t bat_base = bat_not_charging ? cfg.color_bat_idle : cfg.color_bat;
+        draw_segment(pct, bat_base, cfg.color_bat_mid, cfg.color_bat_low, cfg.bat_mid_pct, cfg.bat_low_pct, true, true, bat_charging);
     }
 
-    wl_surface_attach(surface, b.wlbuf, 0, 0);
-    wl_surface_damage_buffer(surface, 0, 0, width, cfg.height);
-    b.busy = true;
-    wl_surface_commit(surface);
-    cur_buffer ^= 1;
+    commit_frame(b, width);
 }
 
 // ---------------------------------------------------------------------- //
@@ -1015,7 +1207,10 @@ const zwlr_layer_surface_v1_listener layer_surface_listener = {
                 configured = alloc_shm(surf_width, cfg.height);
             }
         }
-        if (configured) draw(surf_width);
+        if (configured) {
+            has_last_frame = false; // the compositor expects a fresh commit after configure
+            draw(surf_width);
+        }
     },
     .closed = [](void *, zwlr_layer_surface_v1 *) { running = false; },
 };
@@ -1036,10 +1231,40 @@ const wl_registry_listener registry_listener = {
     .global_remove = [](void *, wl_registry *, uint32_t) {},
 };
 
+// SIGHUP: the handler only sets a flag; the main loop does the reload.
+void on_sighup(int) {
+    reload_pending = 1;
+}
+
+// Re-reads barcpp.conf. Layout changes are applied to the layer surface; a height
+// change also reallocates the shm buffers once the compositor sends a new configure.
+void reload_config() {
+    const int old_height = cfg.height;
+    cfg = Config{};
+    load_config();
+
+    if (layer_surface) {
+        zwlr_layer_surface_v1_set_margin(layer_surface, 0, cfg.margin_right_px, 0, cfg.margin_left_px);
+        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, cfg.push_windows_px);
+        if (cfg.height != old_height) {
+            zwlr_layer_surface_v1_set_size(layer_surface, 0, cfg.height);
+            free_shm();
+            configured = false;
+        }
+        wl_surface_commit(surface);
+    }
+    fprintf(stderr, "barcpp: config reloaded\n");
+}
+
 } // namespace
 
 int main() {
     load_config();
+
+    struct sigaction sa {};
+    sa.sa_handler = on_sighup;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGHUP, &sa, nullptr);
 
     display = wl_display_connect(nullptr);
     if (!display) {
@@ -1080,6 +1305,10 @@ int main() {
 
     int wl_fd = wl_display_get_fd(display);
     while (running) {
+        if (reload_pending) {
+            reload_pending = 0;
+            reload_config();
+        }
         wl_display_flush(display);
 
         pollfd pfd{wl_fd, POLLIN, 0};

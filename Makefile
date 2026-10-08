@@ -48,13 +48,22 @@ protocols/wlr-layer-shell-client-protocol.o: protocols/wlr-layer-shell-client-pr
 protocols/xdg-shell-client-protocol.o: protocols/xdg-shell-client-protocol.c
 	$(CC) $(CFLAGS) $(CXXINC) -c $< -o $@
 
-src/main.o: src/main.cpp protocols/wlr-layer-shell-client-protocol.h protocols/xdg-shell-client-protocol.h
+src/main.o: src/main.cpp src/logic.h protocols/wlr-layer-shell-client-protocol.h protocols/xdg-shell-client-protocol.h
 	$(CXX) $(CXXFLAGS) $(CXXINC) -c $< -o $@
 
 barcpp: src/main.o protocols/wlr-layer-shell-client-protocol.o protocols/xdg-shell-client-protocol.o
 	$(CXX) $^ -o $@ $(LIBS)
 
-clean:
-	rm -f barcpp src/main.o protocols/*.o protocols/*-client-protocol.h protocols/*-client-protocol.c
+# --- unit tests for the threshold logic (no Wayland needed) -----------------
+TEST_BIN := tests/test_logic
 
-.PHONY: all clean
+test: $(TEST_BIN)
+	./$(TEST_BIN)
+
+$(TEST_BIN): tests/test_logic.cpp src/logic.h
+	$(CXX) -std=c++20 -O2 -Wall -Wextra -Isrc $< -o $@
+
+clean:
+	rm -f barcpp src/main.o protocols/*.o protocols/*-client-protocol.h protocols/*-client-protocol.c $(TEST_BIN)
+
+.PHONY: all clean test
